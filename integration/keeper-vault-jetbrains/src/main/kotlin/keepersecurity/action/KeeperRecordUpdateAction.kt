@@ -14,6 +14,7 @@ import com.intellij.openapi.progress.Task
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.util.TextRange
 import keepersecurity.service.KeeperShellService
+import keepersecurity.util.KeeperCommandUtils
 
 class KeeperRecordUpdateAction : AnAction("Update Keeper Record") {
     private val logger = thisLogger()
@@ -101,13 +102,50 @@ class KeeperRecordUpdateAction : AnAction("Update Keeper Record") {
                     // Build the command without "keeper" prefix since we're in the shell
                     val command = "record-update --record=\"$recordUid\" $formattedField"
                     
-                    logger.info("🔄 Executing record update: $command")
+                    logger.info("Executing record update: $command")
                     
                     // Execute with retry logic for reliability
-                    val output = executeCommandWithRetry(command, 3)
+                    val output = KeeperCommandUtils.executeCommandWithRetry(
+                        command,
+                        KeeperCommandUtils.RetryConfig(
+                            maxRetries = 5, // More retries for first-time runs
+                            timeoutSeconds = 30,
+                            retryDelayMs = 2000, // Longer delay between retries
+                            logLevel = KeeperCommandUtils.LogLevel.INFO,
+                            validation = KeeperCommandUtils.ValidationConfig(
+                                customValidator = { output ->
+                                    // For record-update, empty/minimal output often means success
+                                    // We should REJECT output that contains sync status or errors
+                                    val isSyncStatus = output.contains("Decrypted [") || 
+                                                    output.contains("record(s)") ||
+                                                    output.contains("breachwatch list") ||
+                                                    output.contains("Use \"breachwatch list\" command")
+                                    
+                                    val isErrorMessage = output.contains("error", ignoreCase = true) ||
+                                                    output.contains("failed", ignoreCase = true) ||
+                                                    output.contains("invalid", ignoreCase = true) ||
+                                                    output.contains("not found", ignoreCase = true)
+                                    
+                                    // Success means: no sync status AND no error messages
+                                    // Empty output is actually GOOD for record-update
+                                    val isValid = !isSyncStatus && !isErrorMessage
+                                    
+                                    if (!isValid) {
+                                        logger.debug("Record update validation failed - isSyncStatus: $isSyncStatus, isErrorMessage: $isErrorMessage")
+                                        logger.debug("Output: ${output.take(200)}...")
+                                    } else {
+                                        logger.debug("Record update validation passed - output length: ${output.length}")
+                                    }
+                                    
+                                    isValid
+                                }
+                            )
+                        ),
+                        logger
+                    )
                     
                     val duration = System.currentTimeMillis() - startTime
-                    logger.info("⚡ Record update executed in ${duration}ms")
+                    logger.info("Record update executed in ${duration}ms")
                     
                     val keeperReference = "keeper://$recordUid/field/$fieldName"
 
@@ -119,7 +157,7 @@ class KeeperRecordUpdateAction : AnAction("Update Keeper Record") {
                         }
                         Messages.showInfoMessage(
                             project, 
-                            "✅ Keeper record updated!\n\n$keeperReference\n\n⚡ Executed in persistent shell in ${duration}ms!", 
+                            "Keeper record updated!\n\n$keeperReference\n\nExecuted in persistent shell in ${duration}ms!", 
                             "Keeper Record Updated"
                         )
                     }, ModalityState.defaultModalityState())
@@ -132,65 +170,6 @@ class KeeperRecordUpdateAction : AnAction("Update Keeper Record") {
                 }
             }
         }.queue()
-    }
-
-    /**
-     * Execute command with retry logic to handle shell startup timing
-     */
-    private fun executeCommandWithRetry(command: String, maxRetries: Int): String {
-        var lastException: Exception? = null
-        
-        for (attempt in 1..maxRetries) {
-            try {
-                logger.info("🔄 Attempt $attempt/$maxRetries: $command")
-                
-                val output = KeeperShellService.executeCommand(command, 30) // 30 second timeout
-                
-                // Log the raw output for debugging
-                logger.info("📥 Raw output (${output.length} chars): ${output.take(200)}${if (output.length > 200) "..." else ""}")
-                
-                // Check if output looks valid (record-update typically returns success message or empty)
-                if (output.contains("error", ignoreCase = true) && 
-                    !output.contains("0 errors", ignoreCase = true)) {
-                    throw RuntimeException("Command returned error: $output")
-                }
-                
-                // For record-update, success is often indicated by no errors or a success message
-                if (output.contains("updated", ignoreCase = true) || 
-                    output.contains("success", ignoreCase = true) ||
-                    output.trim().isEmpty() ||
-                    !output.contains("failed", ignoreCase = true)) {
-                    
-                    logger.info("✅ Record update successful on attempt $attempt")
-                    return output
-                } else {
-                    logger.warn("⚠️ Unexpected output format, might need retry")
-                    logger.warn("📋 Full output: $output")
-                    
-                    if (attempt < maxRetries) {
-                        logger.info("🔄 Retrying in 1 second...")
-                        Thread.sleep(1000)
-                        continue
-                    } else {
-                        throw RuntimeException("Unexpected command output after $maxRetries attempts: $output")
-                    }
-                }
-                
-            } catch (ex: Exception) {
-                lastException = ex
-                logger.warn("❌ Attempt $attempt failed: ${ex.message}")
-                
-                if (attempt < maxRetries) {
-                    logger.info("🔄 Retrying in 1 second...")
-                    Thread.sleep(1000)
-                } else {
-                    logger.error("❌ All $maxRetries attempts failed")
-                }
-            }
-        }
-        
-        // If we get here, all retries failed
-        throw lastException ?: RuntimeException("Record update failed after $maxRetries attempts")
     }
 
     private fun showError(message: String, project: com.intellij.openapi.project.Project) {

@@ -13,40 +13,30 @@ class KeeperPluginService {
     private val logger = thisLogger()
     
     init {
-        logger.info("KeeperPluginService initialized - starting background shell")
-        // Start the shell service in background
-        Thread({
-            try {
-                KeeperShellService.startShell()
-                logger.info("Keeper shell service started successfully")
-            } catch (e: Exception) {
-                logger.warn("Failed to start Keeper shell service on plugin load", e)
-            }
-        }, "KeeperShell-Startup").apply { 
-            isDaemon = true 
-            start()
-        }
+        logger.info("KeeperPluginService initialized (shell will start on first use)")
+        // Removed automatic shell startup - now starts only when needed
     }
     
     fun ensureShellReady(): Boolean {
         return if (KeeperShellService.isReady()) {
+            logger.debug("Shell already ready")
             true
         } else {
-            logger.info("Shell not ready, starting...")
+            logger.info("Shell not ready, starting on-demand...")
             KeeperShellService.startShell()
         }
     }
 }
 
 /**
- * Startup activity to initialize the Keeper shell service
+ * Startup activity - no longer auto-starts shell
  */
 class KeeperStartupActivity : ProjectActivity {
     private val logger = thisLogger()
     
     override suspend fun execute(project: Project) {
-        logger.info("Initializing Keeper shell service for project: ${project.name}")
-        // Get the service instance to trigger initialization
+        logger.info("Keeper plugin ready for project: ${project.name} (shell will start when needed)")
+        // Just ensure service is registered, don't start shell
         com.intellij.openapi.components.service<KeeperPluginService>()
     }
 }

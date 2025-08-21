@@ -11,9 +11,14 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.diagnostic.thisLogger
 import keepersecurity.service.KeeperShellService
-import org.json.JSONArray
-import org.json.JSONObject
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.decodeFromString
+import keepersecurity.model.KeeperRecord
+import keepersecurity.util.KeeperJsonUtils
+import kotlinx.serialization.ExperimentalSerializationApi
+import keepersecurity.util.KeeperCommandUtils
 
+@OptIn(ExperimentalSerializationApi::class)
 class KeeperGetSecretAction : AnAction("Get Keeper Secret") {
     private val logger = thisLogger()
 
@@ -29,7 +34,11 @@ class KeeperGetSecretAction : AnAction("Get Keeper Secret") {
                 val startTime = System.currentTimeMillis()
                 val listJson = try {
                     // Add retry logic for the first run
-                    executeCommandWithRetry("list --format json", 3)
+                    KeeperCommandUtils.executeCommandWithRetry(
+                        "list --format json", 
+                        KeeperCommandUtils.Presets.jsonArray(maxRetries = 3),
+                        logger
+                    )
                 } catch (ex: Exception) {
                     logger.error("Failed to get record list from persistent shell", ex)
                     showError(project, "Failed to get Keeper record list: ${ex.message}")
@@ -37,26 +46,23 @@ class KeeperGetSecretAction : AnAction("Get Keeper Secret") {
                 }
 
                 val listDuration = System.currentTimeMillis() - startTime
-                logger.info("⚡ List command executed in ${listDuration}ms")
+                logger.info("List command executed in ${listDuration}ms")
 
                 val records = try {
-                    // Extract JSON from output (skip any non-JSON lines)
-                    val jsonStart = listJson.indexOf('[')
-                    if (jsonStart == -1) throw RuntimeException("No JSON array found in output")
-                    val jsonString = listJson.substring(jsonStart)
-                    JSONArray(jsonString)
+                    val jsonString = KeeperJsonUtils.extractJsonArray(listJson, logger)
+                    json.decodeFromString<List<KeeperRecord>>(jsonString)
                 } catch (ex: Exception) {
                     logger.error("Failed to parse list JSON", ex)
+                    logger.error("Raw output was: $listJson")
                     showError(project, "Failed to parse Keeper list JSON: ${ex.message}")
                     return
                 }
 
                 val titles = mutableListOf<String>()
                 val uidByTitle = mutableMapOf<String, String>()
-                for (i in 0 until records.length()) {
-                    val rec = records.getJSONObject(i)
-                    val title = rec.optString("title", "Untitled")
-                    val uid = rec.optString("record_uid")
+                records.forEach { rec ->
+                    val title = rec.title.ifBlank { "Untitled" }
+                    val uid = rec.recordUid
                     if (uid.isNotBlank()) {
                         titles.add(title)
                         uidByTitle[title] = uid
@@ -96,7 +102,7 @@ class KeeperGetSecretAction : AnAction("Get Keeper Secret") {
                             }
 
                             val recordDuration = System.currentTimeMillis() - recordStartTime
-                            logger.info("⚡ Get record command executed in ${recordDuration}ms")
+                            logger.info("Get record command executed in ${recordDuration}ms")
 
                             if (recordJsonText.isBlank()) {
                                 showError(project, "Failed to get Keeper record details.")
@@ -104,13 +110,11 @@ class KeeperGetSecretAction : AnAction("Get Keeper Secret") {
                             }
 
                             val recordJson = try {
-                                // Extract JSON from output (skip any non-JSON lines)
-                                val jsonStart = recordJsonText.indexOf('{')
-                                if (jsonStart == -1) throw RuntimeException("No JSON object found in output")
-                                val jsonString = recordJsonText.substring(jsonStart)
-                                JSONObject(jsonString)
+                                val jsonString = KeeperJsonUtils.extractJsonObject(recordJsonText, logger)
+                                json.decodeFromString<KeeperRecord>(jsonString)
                             } catch (ex: Exception) {
                                 logger.error("Failed to parse record JSON", ex)
+                                logger.error("Raw output was: $recordJsonText")
                                 showError(project, "Failed to parse Keeper record JSON: ${ex.message}")
                                 return
                             }
@@ -118,29 +122,17 @@ class KeeperGetSecretAction : AnAction("Get Keeper Secret") {
                             val fieldOptions = mutableListOf<Pair<String, String>>()
 
                             // Process standard fields
-                            val fieldsArray = recordJson.optJSONArray("fields")
-                            if (fieldsArray != null) {
-                                for (i in 0 until fieldsArray.length()) {
-                                    val fieldObj = fieldsArray.getJSONObject(i)
-                                    val type = fieldObj.optString("type", "")
-                                    val valueArray = fieldObj.optJSONArray("value")
-                                    if (type.isNotBlank() && valueArray != null && valueArray.length() > 0) {
-                                        fieldOptions.add("$type (standard)" to type)
-                                    }
+                            recordJson.fields?.forEach { field ->
+                                if (field.type.isNotBlank() && !field.value.isNullOrEmpty()) {
+                                    fieldOptions.add("${field.type} (standard)" to field.type)
                                 }
                             }
-
+                        
                             // Process custom fields
-                            val customArray = recordJson.optJSONArray("custom")
-                            if (customArray != null) {
-                                for (i in 0 until customArray.length()) {
-                                    val customObj = customArray.getJSONObject(i)
-                                    val label = customObj.optString("label", "")
-                                    val valueArray = customObj.optJSONArray("value")
-                                    if (label.isNotBlank() && valueArray != null && valueArray.length() > 0) {
-                                        val key = label.replace("\\s".toRegex(), "_")
-                                        fieldOptions.add("$label (custom)" to key)
-                                    }
+                            recordJson.custom?.forEach { customField ->
+                                if (customField.label.isNotBlank() && !customField.value.isNullOrEmpty()) {
+                                    val key = customField.label.replace("\\s".toRegex(), "_")
+                                    fieldOptions.add("${customField.label} (custom)" to "custom.${key}")
                                 }
                             }
 
@@ -177,7 +169,7 @@ class KeeperGetSecretAction : AnAction("Get Keeper Secret") {
                                 // Show success message
                                 Messages.showInfoMessage(
                                     project,
-                                    "✅ Keeper reference inserted!\n\n$keeperNotation\n\n⚡ Executed via persistent shell!",
+                                    "Keeper reference inserted!\n\n$keeperNotation\n\nExecuted via persistent shell!",
                                     "Keeper Reference Added"
                                 )
                             }
@@ -188,58 +180,11 @@ class KeeperGetSecretAction : AnAction("Get Keeper Secret") {
         }.queue()
     }
 
-    /**
-     * Execute command with retry logic to handle shell startup timing
-     */
-    private fun executeCommandWithRetry(command: String, maxRetries: Int): String {
-        var lastException: Exception? = null
-        
-        for (attempt in 1..maxRetries) {
-            try {
-                logger.info("🔄 Attempt $attempt/$maxRetries: $command")
-                
-                val output = KeeperShellService.executeCommand(command, 45) // Longer timeout for first run
-                
-                // Log the raw output for debugging
-                logger.info("📥 Raw output (${output.length} chars): ${output.take(200)}${if (output.length > 200) "..." else ""}")
-                
-                // Check if output looks valid
-                if (output.isBlank()) {
-                    throw RuntimeException("Command returned empty output")
-                }
-                
-                // Check if it contains JSON
-                if (!output.contains('[')) {
-                    logger.warn("⚠️ Output doesn't contain JSON array, might be startup messages")
-                    logger.warn("📋 Full output: $output")
-                    
-                    if (attempt < maxRetries) {
-                        logger.info("🔄 Retrying in 2 seconds...")
-                        Thread.sleep(2000)
-                        continue
-                    } else {
-                        throw RuntimeException("No JSON array found in output after $maxRetries attempts")
-                    }
-                }
-                
-                logger.info("✅ Got valid JSON output on attempt $attempt")
-                return output
-                
-            } catch (ex: Exception) {
-                lastException = ex
-                logger.warn("❌ Attempt $attempt failed: ${ex.message}")
-                
-                if (attempt < maxRetries) {
-                    logger.info("🔄 Retrying in 2 seconds...")
-                    Thread.sleep(2000)
-                } else {
-                    logger.error("❌ All $maxRetries attempts failed")
-                }
-            }
-        }
-        
-        // If we get here, all retries failed
-        throw lastException ?: RuntimeException("Command failed after $maxRetries attempts")
+
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        allowTrailingComma = true
     }
 
     private fun showError(project: Project, message: String) {

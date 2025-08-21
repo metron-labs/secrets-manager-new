@@ -14,8 +14,14 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.ide.util.PropertiesComponent
 import keepersecurity.service.KeeperShellService
-import org.json.JSONArray
+import keepersecurity.util.KeeperCommandUtils
+import keepersecurity.util.KeeperJsonUtils
+import kotlinx.serialization.json.Json  
+import kotlinx.serialization.decodeFromString
+import keepersecurity.model.GeneratedPassword
+import kotlinx.serialization.ExperimentalSerializationApi
 
+@OptIn(ExperimentalSerializationApi::class)
 class KeeperGenerateSecretsAction : AnAction("Keeper Generate Secrets") {
     private val logger = thisLogger()
 
@@ -50,7 +56,7 @@ class KeeperGenerateSecretsAction : AnAction("Keeper Generate Secrets") {
                     val password = generatePasswordWithRetry() ?: throw RuntimeException("Could not generate password.")
                     
                     val generateDuration = System.currentTimeMillis() - startTime
-                    logger.info("⚡ Password generation completed in ${generateDuration}ms")
+                    logger.info("Password generation completed in ${generateDuration}ms")
 
                     // Create Keeper record using persistent shell
                     indicator.text = "Creating Keeper record..."
@@ -59,12 +65,12 @@ class KeeperGenerateSecretsAction : AnAction("Keeper Generate Secrets") {
                     val recordUid = addKeeperRecordWithRetry(title, password, project)
                     
                     val recordDuration = System.currentTimeMillis() - recordStartTime
-                    logger.info("⚡ Record creation completed in ${recordDuration}ms")
+                    logger.info("Record creation completed in ${recordDuration}ms")
 
                     if (recordUid != null) {
                         val keeperReference = "keeper://$recordUid/field/password"
                         val totalDuration = System.currentTimeMillis() - startTime
-                        logger.info("⚡ Total operation completed in ${totalDuration}ms")
+                        logger.info("Total operation completed in ${totalDuration}ms")
 
                         // Replace text in editor on EDT
                         ApplicationManager.getApplication().invokeLater {
@@ -74,7 +80,7 @@ class KeeperGenerateSecretsAction : AnAction("Keeper Generate Secrets") {
                             }
                             Messages.showInfoMessage(
                                 project,
-                                "✅ Keeper record created!\n\n$keeperReference\n\n⚡ Generated via persistent shell in ${totalDuration}ms!",
+                                "Keeper record created!\n\n$keeperReference\n\nGenerated via persistent shell in ${totalDuration}ms!",
                                 "Keeper Secret Generated"
                             )
                         }
@@ -89,47 +95,54 @@ class KeeperGenerateSecretsAction : AnAction("Keeper Generate Secrets") {
         })
     }
 
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        allowTrailingComma = true
+    }
+
     /**
      * Generate password using persistent shell with retry logic
      */
     private fun generatePasswordWithRetry(): String? {
-        var lastException: Exception? = null
-        
-        for (attempt in 1..3) {
-            try {
-                logger.info("🔄 Password generation attempt $attempt/3")
-                
-                val output = KeeperShellService.executeCommand("generate -f json", 30)
-                
-                // Log the raw output for debugging
-                logger.info("📥 Generate output (${output.length} chars): ${output.take(200)}${if (output.length > 200) "..." else ""}")
-                
-                // Check if output looks valid
-                if (output.isBlank()) {
-                    throw RuntimeException("Command returned empty output")
-                }
-                
-                // Extract password from output
-                val password = extractPasswordFromOutput(output)
-                if (password != null) {
-                    logger.info("✅ Generated password successfully on attempt $attempt")
-                    return password
-                }
-                
-                throw RuntimeException("No password found in generate output")
-                
-            } catch (ex: Exception) {
-                lastException = ex
-                logger.warn("❌ Password generation attempt $attempt failed: ${ex.message}")
-                
-                if (attempt < 3) {
-                    logger.info("🔄 Retrying in 1 second...")
-                    Thread.sleep(1000)
-                }
-            }
+        return try {
+            val output = KeeperCommandUtils.executeCommandWithRetry(
+                "generate -f json",
+                KeeperCommandUtils.RetryConfig(
+                    maxRetries = 5, // Increased retries for first-time runs
+                    timeoutSeconds = 30,
+                    retryDelayMs = 2000, // Longer delay between retries
+                    logLevel = KeeperCommandUtils.LogLevel.INFO,
+                    validation = KeeperCommandUtils.ValidationConfig(
+                        customValidator = { output ->
+                            // Should contain actual password JSON, not sync status
+                            val hasPassword = output.contains("password", ignoreCase = true)
+                            val hasJson = output.contains("[") || output.contains("{")
+                            val isNotSyncStatus = !output.contains("Decrypted [") && 
+                                                !output.contains("record(s)") &&
+                                                !output.contains("breachwatch list")
+                            
+                            val isValid = hasPassword && hasJson && isNotSyncStatus
+                            
+                            if (!isValid) {
+                                logger.debug("Generate validation failed - hasPassword: $hasPassword, hasJson: $hasJson, isNotSyncStatus: $isNotSyncStatus")
+                                logger.debug("Output: ${output.take(150)}...")
+                            }
+                            
+                            isValid
+                        }
+                    )
+                ),
+                logger
+            )
+            
+            // Extract password from output
+            extractPasswordFromOutput(output)
+            
+        } catch (ex: Exception) {
+            logger.error("Password generation failed after retries", ex)
+            throw ex
         }
-        
-        throw lastException ?: RuntimeException("Password generation failed after 3 attempts")
     }
 
     /**
@@ -137,28 +150,39 @@ class KeeperGenerateSecretsAction : AnAction("Keeper Generate Secrets") {
      */
     private fun extractPasswordFromOutput(output: String): String? {
         try {
-            // Skip warnings / logs until JSON array starts
-            val jsonStart = output.indexOf('[')
-            if (jsonStart == -1) {
-                logger.warn("⚠️ No JSON array found in generate output")
+            logger.debug("Extracting password from output: ${output.take(200)}...")
+            
+            // Use KeeperJsonUtils to extract the JSON array properly
+            val jsonString = KeeperJsonUtils.extractJsonArray(output, logger)
+            logger.debug("Parsing generate JSON: ${jsonString.take(100)}...")
+
+            val passwordList = json.decodeFromString<List<GeneratedPassword>>(jsonString)
+            if (passwordList.isEmpty()) {
+                logger.warn("Empty JSON array in generate output")
                 return null
             }
             
-            val jsonPart = output.substring(jsonStart).trim()
-            logger.debug("📋 Parsing generate JSON: ${jsonPart.take(100)}...")
-
-            val jsonArray = JSONArray(jsonPart)
-            if (jsonArray.length() == 0) {
-                logger.warn("⚠️ Empty JSON array in generate output")
-                return null
-            }
-
-            val password = jsonArray.getJSONObject(0).optString("password", null)
-            logger.info("✅ Extracted password from JSON (length: ${password?.length ?: 0})")
+            val password = passwordList.firstOrNull()?.password
+            logger.info("Extracted password from JSON (length: ${password?.length ?: 0})")
             return password
             
         } catch (ex: Exception) {
-            logger.error("❌ Failed to parse generate JSON from output: $output", ex)
+            logger.error("Failed to parse generate JSON from output", ex)
+            logger.error("Raw output was: $output")
+            
+            // Fallback: try regex extraction in case JSON parsing fails
+            try {
+                val passwordRegex = Regex(""""password":\s*"([^"]+)"""")
+                val match = passwordRegex.find(output)
+                if (match != null) {
+                    val password = match.groupValues[1]
+                    logger.info("Extracted password using regex fallback (length: ${password.length})")
+                    return password
+                }
+            } catch (regexEx: Exception) {
+                logger.debug("Regex fallback also failed: ${regexEx.message}")
+            }
+            
             return null
         }
     }
@@ -167,58 +191,52 @@ class KeeperGenerateSecretsAction : AnAction("Keeper Generate Secrets") {
      * Add Keeper record using persistent shell with retry logic
      */
     private fun addKeeperRecordWithRetry(title: String, password: String, project: Project): String? {
-        var lastException: Exception? = null
-        
-        for (attempt in 1..3) {
-            try {
-                logger.info("🔄 Record creation attempt $attempt/3 for title: '$title'")
-                
-                val props = PropertiesComponent.getInstance(project)
-                val folderUUID = props.getValue("keeper.folder.uuid")
+        return try {
+            val props = PropertiesComponent.getInstance(project)
+            val folderUUID = props.getValue("keeper.folder.uuid")
 
-                // Build command without 'keeper' prefix (we're in the shell)
-                val cmdParts = mutableListOf(
-                    "record-add",
-                    "--title=\"$title\"",
-                    "--record-type=login"
-                )
+            // Build command without 'keeper' prefix (we're in the shell)
+            val cmdParts = mutableListOf(
+                "record-add",
+                "--title=\"$title\"",
+                "--record-type=login"
+            )
 
-                if (!folderUUID.isNullOrBlank()) {
-                    cmdParts.add("--folder=\"$folderUUID\"")
-                    logger.info("📁 Using folder UUID: $folderUUID")
-                }
-
-                cmdParts.add("password='$password'") // password must be single-quoted for CLI
-
-                val command = cmdParts.joinToString(" ")
-                logger.info("🔧 Running command: $command")
-                
-                val output = KeeperShellService.executeCommand(command, 45) // Longer timeout for record creation
-                
-                // Log the raw output for debugging
-                logger.info("📥 Record-add output (${output.length} chars): ${output.take(300)}${if (output.length > 300) "..." else ""}")
-                
-                // Extract record UID from output
-                val recordUid = extractRecordUidFromOutput(output)
-                if (recordUid != null) {
-                    logger.info("✅ Created record successfully on attempt $attempt: $recordUid")
-                    return recordUid
-                }
-                
-                throw RuntimeException("No record UID found in record-add output")
-                
-            } catch (ex: Exception) {
-                lastException = ex
-                logger.warn("❌ Record creation attempt $attempt failed: ${ex.message}")
-                
-                if (attempt < 3) {
-                    logger.info("🔄 Retrying in 1 second...")
-                    Thread.sleep(1000)
-                }
+            if (!folderUUID.isNullOrBlank()) {
+                cmdParts.add("--folder=\"$folderUUID\"")
+                logger.info("Using folder UUID: $folderUUID")
             }
+
+            cmdParts.add("password='$password'") // password must be single-quoted for CLI
+
+            val command = cmdParts.joinToString(" ")
+            logger.info("🔧 Running command: $command")
+            
+            val output = KeeperCommandUtils.executeCommandWithRetry(
+                command,
+                KeeperCommandUtils.RetryConfig(
+                    maxRetries = 3,
+                    timeoutSeconds = 45, // Longer timeout for record creation
+                    retryDelayMs = 1000,
+                    logLevel = KeeperCommandUtils.LogLevel.INFO,
+                    validation = KeeperCommandUtils.ValidationConfig(
+                        minLength = 10, // Should get some meaningful output
+                        customValidator = { output ->
+                            // Should contain a record UID pattern
+                            Regex("""[A-Za-z0-9_-]{22}""").containsMatchIn(output)
+                        }
+                    )
+                ),
+                logger
+            )
+            
+            // Extract record UID from output
+            extractRecordUidFromOutput(output)
+            
+        } catch (ex: Exception) {
+            logger.error("Record creation failed after retries", ex)
+            throw ex
         }
-        
-        throw lastException ?: RuntimeException("Record creation failed after 3 attempts")
     }
 
     /**
@@ -231,16 +249,16 @@ class KeeperGenerateSecretsAction : AnAction("Keeper Generate Secrets") {
             val recordUid = uidMatch?.value
             
             if (recordUid != null) {
-                logger.info("✅ Extracted record UID: $recordUid")
+                logger.info("Extracted record UID: $recordUid")
             } else {
-                logger.warn("⚠️ No record UID pattern found in output")
-                logger.warn("📋 Full output: $output")
+                logger.warn("No record UID pattern found in output")
+                logger.warn("Full output: $output")
             }
             
             return recordUid
             
         } catch (ex: Exception) {
-            logger.error("❌ Failed to extract record UID from output: $output", ex)
+            logger.error("Failed to extract record UID from output: $output", ex)
             return null
         }
     }

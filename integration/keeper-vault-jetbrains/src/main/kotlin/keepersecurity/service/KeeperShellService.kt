@@ -10,7 +10,7 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
- * Persistent Keeper shell service with robust prompt detection
+ * Persistent Keeper shell service with robust prompt detection, lazy loading, and OS-specific optimizations
  */
 object KeeperShellService {
     private val logger = Logger.getInstance(KeeperShellService::class.java)
@@ -25,6 +25,9 @@ object KeeperShellService {
     private val starting = AtomicBoolean(false)
     private val commandLock = ReentrantLock()
     
+    // Track if this is the first time starting (for better UX messaging)
+    private val firstStart = AtomicBoolean(true)
+    
     // Command execution
     private val currentCommand = AtomicReference<CommandExecution?>(null)
     
@@ -35,6 +38,11 @@ object KeeperShellService {
     // Reader thread
     @Volatile private var readerThread: Thread? = null
     
+    // OS detection
+    private val isWindows = System.getProperty("os.name").lowercase().contains("windows")
+    private val isMacOS = System.getProperty("os.name").lowercase().contains("mac")
+    private val isLinux = System.getProperty("os.name").lowercase().contains("linux")
+    
     data class CommandExecution(
         val future: CompletableFuture<String>,
         val commandText: String,
@@ -42,11 +50,90 @@ object KeeperShellService {
     )
     
     /**
+     * Check if Keeper CLI is available on the system
+     */
+    private fun isKeeperCLIAvailable(): Boolean {
+        return try {
+            val process = ProcessBuilder("keeper", "--version")
+                .redirectErrorStream(true)
+                .start()
+            val exitCode = process.waitFor()
+            process.destroy()
+            exitCode == 0
+        } catch (e: Exception) {
+            logger.warn("Keeper CLI availability check failed", e)
+            false
+        }
+    }
+    
+    /**
+     * Get detailed error message for missing Keeper CLI
+     */
+    private fun getKeeperCLIMissingMessage(): String {
+        return if (isWindows) {
+            """
+            Keeper Commander CLI not found on Windows
+            
+            Please install it using one of these methods:
+            
+            1. Using pip (recommended):
+               pip install keepercommander
+            
+            2. Using pip3:
+               pip3 install keepercommander
+            
+            3. Using Python directly:
+               python -m pip install keepercommander
+            
+            After installation:
+            - Restart IntelliJ IDEA
+            - Run 'keeper login' in Command Prompt
+            - Authenticate with your Keeper account
+            
+            Make sure Python and pip are in your Windows PATH.
+            """.trimIndent()
+        } else {
+            """
+            Keeper Commander CLI not found
+            
+            Please install it using:
+            pip install keepercommander
+            
+            Then run 'keeper login' to authenticate.
+            """.trimIndent()
+        }
+    }
+    
+    /**
+     * Get OS-specific timeout for shell initialization
+     */
+    private fun getShellInitTimeout(): Long {
+        return when {
+            isWindows -> 120_000L  // 2 minutes for Windows (slow auth + sync)
+            isMacOS -> 45_000L     // 45 seconds for macOS (typically faster)
+            isLinux -> 45_000L     // 45 seconds for Linux (typically faster)
+            else -> 60_000L        // 1 minute default for unknown OS
+        }
+    }
+    
+    /**
+     * Get OS-specific timeout description
+     */
+    private fun getTimeoutDescription(): String {
+        return when {
+            isWindows -> "up to 2 minutes on Windows (authentication + sync)"
+            isMacOS -> "up to 45 seconds on macOS"
+            isLinux -> "up to 45 seconds on Linux" 
+            else -> "up to 1 minute"
+        }
+    }
+    
+    /**
      * Start the persistent keeper shell
      */
     fun startShell(): Boolean {
         if (shellReady.get()) {
-            logger.info("✅ Shell already running")
+            logger.debug("Shell already running")
             return true
         }
         
@@ -55,7 +142,20 @@ object KeeperShellService {
         }
         
         try {
-            logger.info("🚀 Starting persistent Keeper shell...")
+            // Check if Keeper CLI is available first
+            if (!isKeeperCLIAvailable()) {
+                val errorMessage = getKeeperCLIMissingMessage()
+                logger.error(errorMessage)
+                throw RuntimeException(errorMessage)
+            }
+            
+            // Better logging for first-time vs restart
+            if (firstStart.get()) {
+                logger.info("Starting Keeper shell on first use (user action triggered)")
+                firstStart.set(false)
+            } else {
+                logger.info("Restarting Keeper shell")
+            }
             
             // Start keeper shell process
             process = ProcessBuilder("keeper", "shell")
@@ -68,23 +168,35 @@ object KeeperShellService {
             // Start the output reader thread
             startReaderThread()
             
-            // Wait for shell to be ready using multiple strategies
+            // Wait for shell to be ready using OS-specific strategies
             val success = waitForShellInitialization()
             
             if (success) {
                 shellReady.set(true)
-                logger.info("✅ Keeper shell ready! Can now execute commands.")
+                logger.info("Keeper shell ready! Can now execute commands.")
             } else {
                 cleanup()
-                logger.error("❌ Failed to initialize Keeper shell")
+                logger.error("Failed to initialize Keeper shell")
             }
             
             return success
             
+        } catch (e: IOException) {
+            // Handle the specific "CreateProcess error=2" on Windows
+            val errorMessage = when {
+                e.message?.contains("CreateProcess error=2") == true -> getKeeperCLIMissingMessage()
+                e.message?.contains("No such file or directory") == true -> getKeeperCLIMissingMessage()
+                else -> "Failed to start Keeper shell: ${e.message}"
+            }
+            
+            logger.error(errorMessage, e)
+            cleanup()
+            throw RuntimeException(errorMessage, e)
+            
         } catch (e: Exception) {
             logger.error("Failed to start Keeper shell", e)
             cleanup()
-            return false
+            throw RuntimeException("Failed to start Keeper shell: ${e.message}", e)
         } finally {
             starting.set(false)
         }
@@ -92,7 +204,7 @@ object KeeperShellService {
     
     private fun startReaderThread() {
         readerThread = Thread({
-            logger.info("📖 Reader thread started")
+            logger.debug("Reader thread started")
             
             try {
                 val buffer = CharArray(256)
@@ -114,7 +226,7 @@ object KeeperShellService {
             } catch (e: Exception) {
                 logger.warn("Reader thread error", e)
             } finally {
-                logger.info("📖 Reader thread stopped")
+                logger.debug("Reader thread stopped")
             }
         }, "KeeperShell-Reader")
         
@@ -160,36 +272,54 @@ object KeeperShellService {
     
     private fun processCompleteLine(line: String) {
         when {
-            line.contains("urllib3") -> logger.debug("📥 Warning: $line")
-            line.contains("#") && line.length > 50 -> logger.debug("📥 Banner: ASCII art")
-            line.contains("Keeper") && line.contains("Commander") -> logger.info("📥 Banner: $line")
-            line.contains("version") -> logger.info("📥 Version: $line")
-            line.contains("Logging in") -> logger.info("📥 Auth: $line")
-            line.contains("Successfully authenticated") -> logger.info("📥 Auth: $line")
-            line.contains("Syncing") -> logger.info("📥 Sync: $line")
-            line.contains("Decrypted") -> logger.info("📥 Sync: $line")
-            line.contains("breachwatch") -> logger.debug("📥 Info: $line")
-            line.trim().isNotEmpty() -> logger.debug("📥 Output: $line")
+            line.contains("urllib3") -> logger.debug("Warning: $line")
+            line.contains("#") && line.length > 50 -> logger.debug("Banner: ASCII art")
+            line.contains("Keeper") && line.contains("Commander") -> logger.info("Banner: $line")
+            line.contains("version") -> logger.info("Version: $line")
+            line.contains("Logging in") -> logger.info("Auth: Starting authentication...")
+            line.contains("Successfully authenticated") -> {
+                logger.info("Auth: $line")
+                if (isWindows) logger.info("Windows: Authentication successful, preparing vault...")
+            }
+            line.contains("Syncing") -> {
+                logger.info("Sync: $line")
+                if (isWindows) logger.info("Windows: Syncing vault data...")
+            }
+            line.contains("Decrypted") -> {
+                logger.info("Sync: $line")
+                if (isWindows) logger.info("Windows: Vault sync complete!")
+            }
+            line.contains("My Vault>") -> logger.info("Shell ready: $line")
+            line.contains("Not logged in>") -> logger.warn("Shell ready but not authenticated: $line")
+            line.contains("breachwatch") -> logger.debug("Info: $line")
+            line.trim().isNotEmpty() -> logger.debug("Output: $line")
         }
     }
     
     private fun isShellReady(text: String): Boolean {
-        // Multiple ways to detect that shell is ready
+        // Multiple ways to detect that shell is ready or progressing
         return text.contains("My Vault>") || 
                text.contains("Keeper>") ||
+               text.contains("Not logged in>") ||
+               // Key improvement: Recognize successful authentication even if still syncing
+               text.contains("Successfully authenticated") ||
+               // Also recognize when sync is complete
                (text.contains("Decrypted") && text.contains("record(s)")) ||
+               // Full completion pattern
                (text.contains("Successfully authenticated") && 
                 text.contains("Syncing") && 
                 text.contains("Decrypted"))
     }
     
     private fun isCommandComplete(text: String): Boolean {
-        return text.contains("My Vault>") || text.contains("Keeper>")
+        return text.contains("My Vault>") || 
+               text.contains("Keeper>") ||
+               text.contains("Not logged in>")
     }
     
     private fun handleShellReady() {
         if (!shellReady.get()) {
-            logger.info("🎯 Shell ready detected!")
+            logger.info("Shell ready detected!")
             
             // Send a test command to trigger the prompt
             try {
@@ -197,7 +327,7 @@ object KeeperShellService {
                     write("\n")  // Send empty line to trigger prompt
                     flush()
                 }
-                logger.info("📤 Sent newline to trigger prompt")
+                logger.debug("Sent newline to trigger prompt")
             } catch (e: Exception) {
                 logger.debug("Error sending newline", e)
             }
@@ -207,8 +337,8 @@ object KeeperShellService {
     private fun handleCommandComplete(execution: CommandExecution, fullOutput: String) {
         val result = extractCommandOutput(fullOutput, execution.commandText)
         
-        logger.info("✅ Command '${execution.commandText}' completed in ${System.currentTimeMillis() - execution.startTime}ms")
-        logger.debug("📤 Command result (${result.length} chars): ${result.take(200)}${if (result.length > 200) "..." else ""}")
+        logger.info("Command '${execution.commandText}' completed in ${System.currentTimeMillis() - execution.startTime}ms")
+        logger.debug("Command result (${result.length} chars): ${result.take(200)}${if (result.length > 200) "..." else ""}")
         
         execution.future.complete(result)
         
@@ -231,30 +361,30 @@ object KeeperShellService {
         if (commandLineIndex == -1) {
             // Command line not found, return everything except prompt lines
             return lines.filter { line ->
-                !line.contains("My Vault>") && !line.contains("Keeper>")
+                !line.contains("My Vault>") && !line.contains("Keeper>") && !line.contains("Not logged in>")
             }.joinToString("\n").trim()
         }
         
         // Return everything after the command line, except prompt lines
         return lines.drop(commandLineIndex + 1)
             .filter { line ->
-                !line.contains("My Vault>") && !line.contains("Keeper>")
+                !line.contains("My Vault>") && !line.contains("Keeper>") && !line.contains("Not logged in>")
             }
             .joinToString("\n").trim()
     }
     
     private fun waitForShellInitialization(): Boolean {
         val startTime = System.currentTimeMillis()
-        val timeoutMs = 45_000L // 45 seconds for initial startup
+        val timeoutMs = getShellInitTimeout()
         
-        logger.info("⏳ Waiting for Keeper shell to be ready (up to 45 seconds)...")
+        logger.info("Waiting for Keeper shell to be ready (${getTimeoutDescription()})...")
         
         while (System.currentTimeMillis() - startTime < timeoutMs) {
             bufferLock.withLock {
                 val currentOutput = outputBuffer.toString()
                 
                 if (isShellReady(currentOutput)) {
-                    logger.info("🎯 Shell appears ready based on output content")
+                    logger.info("Shell appears ready based on output content")
                     
                     // Try to get a prompt by sending a newline
                     try {
@@ -266,12 +396,12 @@ object KeeperShellService {
                         
                         // Check if we got a prompt after the newline
                         val updatedOutput = outputBuffer.toString()
-                        if (updatedOutput.contains("My Vault>") || updatedOutput.contains("Keeper>")) {
-                            logger.info("🎯 Confirmed: Got prompt after sending newline")
+                        if (updatedOutput.contains("My Vault>") || updatedOutput.contains("Keeper>") || updatedOutput.contains("Not logged in>")) {
+                            logger.info("Confirmed: Got prompt after sending newline")
                             outputBuffer.setLength(0) // Clear startup output
                             return true
-                        } else {
-                            logger.info("🎯 No prompt yet, but shell seems ready. Assuming it's working.")
+                        } else if (updatedOutput.contains("Successfully authenticated")) {
+                            logger.info("Authentication successful, shell is ready even if still syncing")
                             outputBuffer.setLength(0) // Clear startup output  
                             return true
                         }
@@ -280,17 +410,20 @@ object KeeperShellService {
                     }
                 }
                 
-                // Show progress every 5 seconds
+                // Show OS-specific progress messages
                 val elapsed = System.currentTimeMillis() - startTime
-                if (elapsed % 5000 < 200) {
+                if (elapsed % 10_000L < 200) { // Every 10 seconds
                     val lastLines = currentOutput.lines().takeLast(3).joinToString(" | ")
-                    logger.info("⏳ Still waiting (${elapsed/1000}s)... Recent: $lastLines")
+                    when {
+                        isWindows -> logger.info("Windows: Still waiting (${elapsed/1000}s)... Recent: $lastLines")
+                        else -> logger.info("Still waiting (${elapsed/1000}s)... Recent: $lastLines")
+                    }
                 }
             }
             
             // Check if process died
             if (process?.isAlive != true) {
-                logger.error("❌ Keeper shell process died during startup")
+                logger.error("Keeper shell process died during startup")
                 return false
             }
             
@@ -300,9 +433,14 @@ object KeeperShellService {
         // Timeout - show diagnostic info
         bufferLock.withLock {
             val output = outputBuffer.toString()
-            logger.error("❌ Timeout waiting for shell ready after ${timeoutMs}ms")
-            logger.error("📋 Process alive: ${process?.isAlive}")
-            logger.error("📋 Full output: '$output'")
+            logger.error("Timeout waiting for shell ready after ${timeoutMs}ms")
+            logger.error("Process alive: ${process?.isAlive}")
+            logger.error("OS: ${System.getProperty("os.name")}")
+            logger.error("Full output: '$output'")
+            
+            if (isWindows && output.contains("Logging in to Keeper Commander") && !output.contains("Successfully authenticated")) {
+                logger.error("Windows: Keeper authentication is taking longer than expected. Check network connectivity.")
+            }
         }
         
         return false
@@ -313,9 +451,9 @@ object KeeperShellService {
      */
     fun executeCommand(command: String, timeoutSeconds: Long = 30): String {
         commandLock.withLock {
-            // Ensure shell is running
+            // Ensure shell is running - this is where lazy loading happens
             if (!ensureShellRunning()) {
-                throw IllegalStateException("Could not start Keeper shell")
+                throw IllegalStateException("Could not start Keeper shell. Please ensure Keeper CLI is installed and you're authenticated.")
             }
             
             // Create command execution context
@@ -323,7 +461,7 @@ object KeeperShellService {
             currentCommand.set(execution)
             
             try {
-                logger.info("🔄 Executing command: $command")
+                logger.info("Executing command: $command")
                 
                 // Clear buffer before sending command
                 bufferLock.withLock {
@@ -362,7 +500,7 @@ object KeeperShellService {
      * Stop the shell gracefully
      */
     fun stopShell() {
-        logger.info("🛑 Stopping persistent Keeper shell...")
+        logger.info("Stopping persistent Keeper shell...")
         shellReady.set(false)
         
         try {
@@ -380,18 +518,28 @@ object KeeperShellService {
     
     // Private helper methods
     
+    /**
+     * Ensure shell is running - this is the key method for lazy loading
+     */
     private fun ensureShellRunning(): Boolean {
         return if (isReady()) {
+            logger.debug("Shell already ready")
             true
         } else {
-            logger.info("Shell not ready, starting...")
-            startShell()
+            logger.info("Shell not ready, starting on-demand due to user action...")
+            try {
+                startShell()
+            } catch (e: Exception) {
+                logger.error("Failed to start shell", e)
+                false
+            }
         }
     }
     
     private fun waitForStartupComplete(): Boolean {
+        val maxAttempts = if (isWindows) 1200 else 450 // 2 minutes for Windows, 45 seconds for others
         var attempts = 0
-        while (starting.get() && attempts < 450) { // 45 seconds
+        while (starting.get() && attempts < maxAttempts) {
             Thread.sleep(100)
             attempts++
         }
@@ -419,6 +567,15 @@ object KeeperShellService {
             outputBuffer.setLength(0)
         }
         
-        logger.info("🧹 Cleanup completed")
+        logger.info("Cleanup completed")
+    }
+
+    /**
+    * Get the last startup output for authentication detection
+    */
+    fun getLastStartupOutput(): String {
+        return bufferLock.withLock {
+            outputBuffer.toString()
+        }
     }
 }

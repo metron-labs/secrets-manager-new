@@ -8,6 +8,7 @@ import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import keepersecurity.service.KeeperShellService
+import keepersecurity.util.KeeperCommandUtils
 
 class KeeperAuthAction : AnAction("Check Keeper Authorization") {
     private val logger = thisLogger()
@@ -18,7 +19,7 @@ class KeeperAuthAction : AnAction("Check Keeper Authorization") {
         object : Task.Backgroundable(project, "Checking Keeper Authentication...", false) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    logger.info("=== KEEPER AUTH: Starting comprehensive authentication check ===")
+                    logger.info("KEEPER AUTH: Checking biometric and persistent login ===")
                     
                     indicator.text = "Connecting to Keeper shell..."
                     
@@ -26,90 +27,74 @@ class KeeperAuthAction : AnAction("Check Keeper Authorization") {
                     if (!KeeperShellService.isReady()) {
                         indicator.text = "Starting Keeper shell..."
                         if (!KeeperShellService.startShell()) {
-                            showError(project, "❌ Failed to start Keeper shell. Please check your Keeper CLI installation.")
+                            showError(project, "Failed to start Keeper shell. Please check your Keeper CLI installation.")
                             return
                         }
                     }
                     
-                    // Step 1: Check if we can access the vault at all
-                    indicator.text = "Checking vault access..."
-                    if (!checkBasicAccess()) {
-                        showError(project, "❌ Cannot access Keeper vault. Please run 'keeper login' in terminal first.")
-                        return
-                    }
-                    
-                    // Step 2: Try biometric authentication first
+                    // Step 1: Try biometric authentication first
                     indicator.text = "Checking biometric authentication..."
                     val biometricResult = checkBiometricAuth()
                     
-                    when (biometricResult) {
-                        BiometricStatus.SUCCESS -> {
-                            logger.info("✅ Biometric authentication successful")
-                            showSuccess(project, "✅ Keeper Authentication Successful!\n\n🔐 Biometric authentication is working correctly.\n\n⚡ All actions will use the persistent shell for maximum speed!")
-                            return
-                        }
-                        BiometricStatus.NOT_REGISTERED -> {
-                            logger.info("⚠️ Biometric not registered, attempting to register...")
-                            indicator.text = "Setting up biometric authentication..."
-                            
-                            if (setupBiometric()) {
-                                logger.info("✅ Biometric setup successful")
-                                showSuccess(project, "✅ Keeper Authentication Setup Complete!\n\n🔐 Biometric authentication has been configured and is working.\n\n⚡ All actions will use the persistent shell for maximum speed!")
-                                return
-                            } else {
-                                logger.warn("⚠️ Biometric setup failed, falling back to persistent login")
-                                indicator.text = "Biometric setup failed, checking persistent login..."
-                            }
-                        }
-                        BiometricStatus.NOT_SUPPORTED -> {
-                            logger.info("ℹ️ Biometric not supported on this device, checking persistent login")
-                            indicator.text = "Biometric not supported, checking persistent login..."
-                        }
-                        BiometricStatus.FAILED -> {
-                            logger.warn("⚠️ Biometric verification failed, falling back to persistent login")
-                            indicator.text = "Biometric failed, checking persistent login..."
-                        }
+                    if (biometricResult == BiometricStatus.SUCCESS) {
+                        logger.info("Biometric authentication successful")
+                        showSuccess(project, 
+                            "Keeper Authentication Successful!\n\n" +
+                            "Biometric authentication is working correctly.\n" +
+                            "All actions will use the persistent shell for maximum speed!"
+                        )
+                        return
                     }
                     
-                    // Step 3: Fall back to persistent login
+                    logger.info("Biometric not working, checking persistent login...")
+                    
+                    // Step 2: If biometric failed/unavailable, try persistent login
                     indicator.text = "Checking persistent login..."
                     val persistentResult = checkPersistentLogin()
                     
-                    when (persistentResult) {
-                        PersistentStatus.SUCCESS -> {
-                            logger.info("✅ Persistent login successful")
-                            showSuccess(project, "✅ Keeper Authentication Successful!\n\n🔑 Persistent login is enabled and working.\n\nNote: Consider enabling biometric authentication for enhanced security.\n\n⚡ All actions will use the persistent shell for maximum speed!")
-                            return
-                        }
-                        PersistentStatus.NOT_ENABLED -> {
-                            logger.info("⚠️ Persistent login not enabled, attempting to enable...")
-                            indicator.text = "Setting up persistent login..."
-                            
-                            if (setupPersistentLogin()) {
-                                logger.info("✅ Persistent login setup successful")
-                                showSuccess(project, "✅ Keeper Authentication Setup Complete!\n\n🔑 Persistent login has been enabled and is working.\n\nNote: Consider enabling biometric authentication for enhanced security.\n\n⚡ All actions will use the persistent shell for maximum speed!")
-                                return
-                            } else {
-                                logger.error("❌ Failed to setup persistent login")
-                                showSetupError(project)
-                                return
-                            }
-                        }
-                        PersistentStatus.FAILED -> {
-                            logger.error("❌ Persistent login check failed")
-                            showSetupError(project)
-                            return
-                        }
+                    if (persistentResult == PersistentStatus.SUCCESS) {
+                        logger.info("Persistent login successful")
+                        showSuccess(project, 
+                            "Keeper Authentication Successful!\n\n" +
+                            "Persistent login is enabled and working.\n" +
+                            "Consider enabling biometric authentication for enhanced security.\n" +
+                            "All actions will use the persistent shell for maximum speed!"
+                        )
+                        return
                     }
                     
+                    // Step 3: Neither biometric nor persistent login worked
+                    logger.error("Neither biometric nor persistent login is available")
+                    showAuthRequiredError(project)
+                    
                 } catch (ex: Exception) {
-                    logger.error("=== KEEPER AUTH: Exception during comprehensive check ===", ex)
-                    showError(project, "❌ Unexpected error during authentication check: ${ex.message}")
+                    logger.error("KEEPER AUTH: Exception during authentication check", ex)
+                    showError(project, "Unexpected error during authentication check: ${ex.message}")
                 }
             }
         }.queue()
     }
     
+    private fun showAuthRequiredError(project: Project) {
+        com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+            Messages.showErrorDialog(
+                project,
+                "Keeper Authentication Required!\n\n" +
+                "You need to enable either biometric authentication or persistent login.\n\n" +
+                "Option 1 - Enable Biometric Authentication:\n" +
+                "1. Run 'keeper shell' in terminal\n" +
+                "2. Run 'biometric register'\n" +
+                "3. Follow the prompts\n\n" +
+                "Option 2 - Enable Persistent Login:\n" +
+                "1. Run 'keeper shell' in terminal\n" +
+                "2. Run 'this-device register'\n" +
+                "3. Run 'this-device persistent-login on'\n\n" +
+                "Then try this action again.",
+                "Authentication Setup Required"
+            )
+        }
+    }
+
     private enum class BiometricStatus {
         SUCCESS, NOT_REGISTERED, NOT_SUPPORTED, FAILED
     }
@@ -118,46 +103,36 @@ class KeeperAuthAction : AnAction("Check Keeper Authorization") {
         SUCCESS, NOT_ENABLED, FAILED
     }
     
-    private fun checkBasicAccess(): Boolean {
-        return try {
-            val output = KeeperShellService.executeCommand("list", 10)
-            logger.info("Basic access check - output length: ${output.length}")
-            !output.contains("not logged in", ignoreCase = true) && 
-            !output.contains("login required", ignoreCase = true)
-        } catch (ex: Exception) {
-            logger.error("Basic access check failed", ex)
-            false
-        }
-    }
-    
     private fun checkBiometricAuth(): BiometricStatus {
         return try {
-            logger.info("🔐 Checking biometric authentication...")
-            val output = KeeperShellService.executeCommand("biometric verify", 15)
-            logger.info("Biometric verify output: $output")
+            logger.info("Checking if biometric authentication was used during login...")
             
-            when {
-                output.contains("Status: SUCCESSFUL", ignoreCase = true) -> {
-                    logger.info("✅ Biometric verification successful")
-                    BiometricStatus.SUCCESS
-                }
-                output.contains("not registered", ignoreCase = true) || 
-                output.contains("no biometric", ignoreCase = true) -> {
-                    logger.info("⚠️ Biometric not registered")
-                    BiometricStatus.NOT_REGISTERED
-                }
-                output.contains("not supported", ignoreCase = true) ||
-                output.contains("not available", ignoreCase = true) -> {
-                    logger.info("ℹ️ Biometric not supported on this device")
-                    BiometricStatus.NOT_SUPPORTED
-                }
-                else -> {
-                    logger.warn("⚠️ Biometric verification failed or unknown response")
-                    BiometricStatus.FAILED
-                }
+            // Wait a moment for shell to fully complete startup and capture all output
+            Thread.sleep(20000)
+            
+            val startupOutput = KeeperShellService.getLastStartupOutput()
+            
+            // DEBUG: Log the full output to see what we're actually getting
+            logger.info("=== FULL STARTUP OUTPUT DEBUG ===")
+            logger.info("Output length: ${startupOutput.length}")
+            logger.info("Full output:\n$startupOutput")
+            logger.info("=== END DEBUG OUTPUT ===")
+            
+            // Look for the exact string from your terminal
+            val hasBiometric = startupOutput.contains("Successfully authenticated with Biometric Login", ignoreCase = true)
+            
+            logger.info("Biometric string found: $hasBiometric")
+            
+            if (hasBiometric) {
+                logger.info("Biometric authentication detected!")
+                BiometricStatus.SUCCESS
+            } else {
+                logger.info("ℹ️  No biometric authentication detected in startup output")
+                BiometricStatus.FAILED
             }
+            
         } catch (ex: Exception) {
-            logger.error("Biometric check failed", ex)
+            logger.error("Error checking biometric from startup", ex)
             BiometricStatus.FAILED
         }
     }
@@ -193,28 +168,56 @@ class KeeperAuthAction : AnAction("Check Keeper Authorization") {
     
     private fun checkPersistentLogin(): PersistentStatus {
         return try {
-            logger.info("🔑 Checking persistent login status...")
-            val output = KeeperShellService.executeCommand("this-device", 10)
-            logger.info("This-device output: $output")
+            logger.info("Checking persistent login status...")
+            
+            val output = KeeperCommandUtils.executeCommandWithRetry(
+                "this-device",
+                KeeperCommandUtils.RetryConfig(
+                    maxRetries = 3,
+                    timeoutSeconds = 15,
+                    retryDelayMs = 2000,
+                    logLevel = KeeperCommandUtils.LogLevel.INFO,
+                    validation = KeeperCommandUtils.ValidationConfig(
+                        customValidator = { result ->
+                            // Should contain device info, NOT sync status or biometric results
+                            val hasDeviceInfo = result.contains("Device Name:", ignoreCase = true) ||
+                                            result.contains("Persistent Login:", ignoreCase = true)
+                            
+                            val isNotSyncStatus = !result.contains("Decrypted [") && 
+                                                !result.contains("record(s)") &&
+                                                !result.contains("breachwatch") &&
+                                                !result.contains("Biometric Authentication")
+                            
+                            hasDeviceInfo && isNotSyncStatus
+                        }
+                    )
+                ),
+                logger
+            )
+            
+            logger.info("This-device FINAL output: $output")
             
             when {
-                output.contains("Persistent Login: ON", ignoreCase = true) ||
-                output.contains("Persistent Login:\\s*ON".toRegex()) -> {
-                    logger.info("✅ Persistent login is enabled")
+                // Success patterns - exactly what your terminal shows
+                output.contains("Persistent Login: ON", ignoreCase = true) -> {
+                    logger.info("Persistent login is enabled")
                     PersistentStatus.SUCCESS
                 }
-                output.contains("Persistent Login: OFF", ignoreCase = true) ||
-                output.contains("Persistent Login:\\s*OFF".toRegex()) -> {
-                    logger.info("⚠️ Persistent login is disabled")
+                
+                // Not enabled patterns
+                output.contains("Persistent Login: OFF", ignoreCase = true) -> {
+                    logger.info("ℹ️  Persistent login is disabled")
                     PersistentStatus.NOT_ENABLED
                 }
+                
                 else -> {
-                    logger.warn("⚠️ Could not determine persistent login status")
+                    logger.warn("Persistent login status unclear")
+                    logger.warn("Full output: $output")
                     PersistentStatus.FAILED
                 }
             }
         } catch (ex: Exception) {
-            logger.error("Persistent login check failed", ex)
+            logger.error("Persistent login check exception", ex)
             PersistentStatus.FAILED
         }
     }
@@ -265,13 +268,13 @@ class KeeperAuthAction : AnAction("Check Keeper Authorization") {
         com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
             Messages.showErrorDialog(
                 project,
-                "❌ Failed to setup Keeper authentication.\n\n" +
+                "Failed to setup Keeper authentication.\n\n" +
                 "Please try one of these manual steps:\n\n" +
-                "🔐 For Biometric Authentication:\n" +
+                "For Biometric Authentication:\n" +
                 "1. Run 'keeper shell' in terminal\n" +
                 "2. Run 'biometric register'\n" +
                 "3. Follow the prompts\n\n" +
-                "🔑 For Persistent Login:\n" +
+                "For Persistent Login:\n" +
                 "1. Run 'keeper shell' in terminal\n" +
                 "2. Run 'this-device register'\n" +
                 "3. Run 'this-device persistent-login on'\n\n" +

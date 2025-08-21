@@ -12,15 +12,29 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.VirtualFile
 import keepersecurity.service.KeeperShellService
-import org.json.JSONObject
+import keepersecurity.util.KeeperJsonUtils
+import keepersecurity.util.KeeperCommandUtils
+
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+
 import java.io.File
 import javax.swing.JFileChooser
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
 import javax.swing.UIManager
+import kotlinx.serialization.ExperimentalSerializationApi
 
+@OptIn(ExperimentalSerializationApi::class)
 class KeeperSecretAction : AnAction("Run Keeper Securely") {
     private val logger = thisLogger()
+    
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        allowTrailingComma = true
+    }
 
     override fun actionPerformed(e: AnActionEvent) {
         val project: Project = e.project ?: return
@@ -55,7 +69,7 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
             
             // Save the main script file
             fileDocumentManager.saveDocument(document)
-            logger.info("💾 Saved main script file to disk")
+            logger.info("Saved main script file to disk")
             
             // Save .env file if it's open in the IDE
             val envVirtualFile = file.parent.findChild(envFile.name)
@@ -63,7 +77,7 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
                 val envDocument = fileDocumentManager.getDocument(envVirtualFile)
                 if (envDocument != null) {
                     fileDocumentManager.saveDocument(envDocument)
-                    logger.info("💾 Saved .env file to disk")
+                    logger.info("Saved .env file to disk")
                 }
             }
         }
@@ -79,7 +93,7 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
                     ApplicationManager.getApplication().invokeLater {
                         Messages.showErrorDialog(
                             project,
-                            "❌ Keeper is not ready!\nPlease run 'Check Keeper Authorization' first.",
+                            "Keeper is not ready!\nPlease run 'Check Keeper Authorization' first.",
                             "Keeper Not Ready"
                         )
                     }
@@ -91,7 +105,7 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
                 val result = processKeeperSecrets(originalContent, envFile, file, commandInput, indicator)
                 val totalDuration = System.currentTimeMillis() - startTime
                 
-                logger.info("⚡ Total secret processing completed in ${totalDuration}ms")
+                logger.info("Total secret processing completed in ${totalDuration}ms")
 
                 ApplicationManager.getApplication().invokeLater {
                     if (result.replacements > 0) {
@@ -125,20 +139,21 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
         val options = if (defaultEnv.exists()) {
             arrayOf(".env", "Browse")
         } else {
-            arrayOf("Browse", "Browse") // Still 2 options to satisfy dialog
+            arrayOf("Browse")
         }
 
-        val choiceIndex = Messages.showChooseDialog(
+        val selectedOption = Messages.showEditableChooseDialog(
             "Select .env file:",
             "Choose .env File",
+            null,
             options,
-            options[0],
+            if (defaultEnv.exists()) ".env" else "Browse",
             null
-        )
+        ) ?: return null
 
-        return when (choiceIndex) {
-            0 -> if (defaultEnv.exists()) defaultEnv else browseForEnvFile()
-            1 -> browseForEnvFile()
+        return when (selectedOption) {
+            ".env" -> defaultEnv
+            "Browse" -> browseForEnvFile()
             else -> null
         }
     }
@@ -161,12 +176,12 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
 
     private fun buildSuccessMessage(result: ProcessResult, duration: Long): String {
         return buildString {
-            appendLine("✅ Successfully injected ${result.replacements} secret(s)!")
-            appendLine("⚡ Completed in ${duration}ms using persistent shell!")
-            appendLine("💾 Script executed with latest saved changes!")
+            appendLine("Successfully injected ${result.replacements} secret(s)!")
+            appendLine("Completed in ${duration}ms using persistent shell!")
+            appendLine("Script executed with latest saved changes!")
             if (result.errors.isNotEmpty()) {
                 appendLine()
-                appendLine("⚠️ Some errors occurred:")
+                appendLine("Some errors occurred:")
                 result.errors.take(3).forEach { appendLine("• $it") }
                 if (result.errors.size > 3) appendLine("• ... and ${result.errors.size - 3} more")
             }
@@ -175,10 +190,10 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
 
     private fun buildFailureMessage(result: ProcessResult): String {
         return if (result.errors.isNotEmpty()) {
-            "❌ No secrets were injected.\n\nErrors:\n" +
+            "No secrets were injected.\n\nErrors:\n" +
                     result.errors.take(3).joinToString("\n") { "• $it" }
         } else {
-            "❌ No Keeper references found in .env file!\n\nExpected format:\nKEY=keeper://UID/field/FieldName"
+            "No Keeper references found in .env file!\n\nExpected format:\nKEY=keeper://UID/field/FieldName"
         }
     }
 
@@ -213,11 +228,11 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
                     val uid = match.groupValues[1]
                     val field = match.groupValues[2]
                     keeperRefs.add(Triple(key, uid, field))
-                    logger.info("📋 Found Keeper ref: $key -> keeper://$uid/field/$field")
+                    logger.info("Found Keeper ref: $key -> keeper://$uid/field/$field")
                 }
             }
         } catch (e: Exception) {
-            logger.error("❌ Failed to read .env file: ${envFile.absolutePath}", e)
+            logger.error("Failed to read .env file: ${envFile.absolutePath}", e)
             return ProcessResult(originalContent, 0, listOf("Failed to read .env file: ${e.message}"), "")
         }
         
@@ -237,20 +252,26 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
                 val secretJson = getKeeperJsonFromShell(uid)
                 val secretDuration = System.currentTimeMillis() - secretStartTime
                 
-                logger.info("⚡ Secret $key fetched in ${secretDuration}ms")
+                logger.info("Secret $key fetched in ${secretDuration}ms")
                 
-                val json = JSONObject(secretJson)
-                val secret = json.optString(field, null)
+                val jsonElement = json.parseToJsonElement(secretJson)
+                val secret = try {
+                    jsonElement.jsonObject[field]?.jsonPrimitive?.content
+                } catch (e: Exception) {
+                    logger.warn("Failed to extract field '$field' from JSON", e)
+                    null
+                }
+                
                 if (!secret.isNullOrEmpty()) {
                     envVars[key] = secret
-                    logger.info("✅ Injected: $key=****** (${secret.length} chars)")
+                    logger.info("Injected: $key=****** (${secret.length} chars)")
                 } else {
                     errors.add("Field '$field' not found in Keeper record $uid")
-                    logger.warn("⚠️ Field '$field' not found in record $uid")
+                    logger.warn("Field '$field' not found in record $uid")
                 }
             } catch (e: Exception) {
                 errors.add("Error fetching $uid/$field - ${e.message}")
-                logger.error("❌ Error fetching Keeper secret for $uid/$field", e)
+                logger.error("Error fetching Keeper secret for $uid/$field", e)
             }
         }
         
@@ -277,9 +298,9 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
             val env = pb.environment()
             env.putAll(envVars)
             
-            logger.info("🚀 Running script with ${envVars.size} injected secrets")
-            logger.info("📁 Working directory: ${fileParentDir.absolutePath}")
-            logger.info("🐍 Command: ${commandParts.joinToString(" ")}")
+            logger.info("Running script with ${envVars.size} injected secrets")
+            logger.info("Working directory: ${fileParentDir.absolutePath}")
+            logger.info("Command: ${commandParts.joinToString(" ")}")
             
             val process = pb.start()
             val output = process.inputStream.bufferedReader().use { it.readText() }
@@ -287,27 +308,27 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
             
             logger.info("Script completed with exit code: $exitCode")
             if (exitCode != 0) {
-                errors.add("❌ Command exited with code $exitCode")
+                errors.add("Command exited with code $exitCode")
             }
             output
         } catch (ex: Exception) {
             logger.error("Failed to run script", ex)
-            errors.add("❌ Failed to execute script: ${ex.message}")
+            errors.add("Failed to execute script: ${ex.message}")
             ""
         }
     }
 
     private fun getKeeperJsonFromShell(uid: String): String {
         return try {
-            val output = executeCommandWithRetry("get $uid --format json --legacy", 3)
+            val output = KeeperCommandUtils.executeCommandWithRetry(
+                "get $uid --format json --legacy", 
+                KeeperCommandUtils.Presets.jsonObject(maxRetries = 3),
+                logger
+            )
             
-            val jsonStart = output.indexOf('{')
-            if (jsonStart == -1) {
-                throw RuntimeException("Failed to find JSON in Keeper CLI output")
-            }
-            
-            val jsonString = output.substring(jsonStart).trim()
-            logger.debug("📋 Extracted JSON for $uid (${jsonString.length} chars)")
+            // Use the utility to extract JSON, handling prefixes like "[79] record(s)"
+            val jsonString = KeeperJsonUtils.extractJsonObject(output, logger)
+            logger.debug("Extracted JSON for $uid (${jsonString.length} chars)")
             
             return jsonString
             
@@ -317,72 +338,79 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
         }
     }
 
-    private fun executeCommandWithRetry(command: String, maxRetries: Int): String {
-        var lastException: Exception? = null
-        
-        for (attempt in 1..maxRetries) {
-            try {
-                logger.debug("🔄 Attempt $attempt/$maxRetries: $command")
-                
-                val output = KeeperShellService.executeCommand(command, 30)
-                
-                if (output.isBlank()) {
-                    throw RuntimeException("Command returned empty output")
-                }
-                
-                if (command.startsWith("get") && !output.contains('{')) {
-                    logger.warn("⚠️ Output doesn't contain JSON, might be startup messages")
-                    
-                    if (attempt < maxRetries) {
-                        logger.info("🔄 Retrying in 1 second...")
-                        Thread.sleep(1000)
-                        continue
-                    } else {
-                        throw RuntimeException("No JSON found in output after $maxRetries attempts")
-                    }
-                }
-                
-                logger.debug("✅ Got valid output on attempt $attempt")
-                return output
-                
-            } catch (ex: Exception) {
-                lastException = ex
-                logger.warn("❌ Attempt $attempt failed: ${ex.message}")
-                
-                if (attempt < maxRetries) {
-                    logger.info("🔄 Retrying in 1 second...")
-                    Thread.sleep(1000)
-                } else {
-                    logger.error("❌ All $maxRetries attempts failed")
-                }
-            }
-        }
-        
-        throw lastException ?: RuntimeException("Command failed after $maxRetries attempts")
-    }
-
     private fun isKeeperReady(): Boolean {
         return try {
-            logger.info("🔍 Checking if Keeper shell is ready...")
+            logger.info("Checking if Keeper shell is ready...")
             
-            if (!KeeperShellService.isReady()) {
-                logger.info("🚀 Starting Keeper shell...")
+            val wasAlreadyReady = KeeperShellService.isReady()
+            
+            if (!wasAlreadyReady) {
+                logger.info("Starting Keeper shell...")
                 if (!KeeperShellService.startShell()) {
-                    logger.error("❌ Failed to start Keeper shell")
+                    logger.error("Failed to start Keeper shell")
                     return false
+                }
+                
+                // Shell just started - give it extra time to initialize
+                logger.info("Shell started successfully, waiting for full initialization...")
+                Thread.sleep(5000) // Increased from 3 to 5 seconds
+            }
+            
+            // Use longer timeout for first-time startup, shorter for already running shell
+            val timeoutSeconds = if (wasAlreadyReady) 15L else 45L
+            logger.info("Verifying shell readiness (timeout: ${timeoutSeconds}s)...")
+            
+            // Try a simple command first to test basic responsiveness
+            val output = try {
+                KeeperShellService.executeCommand("", timeoutSeconds) // Send empty command to get prompt
+            } catch (e: Exception) {
+                logger.warn("Empty command failed, trying 'this-device': ${e.message}")
+                KeeperShellService.executeCommand("this-device", timeoutSeconds)
+            }
+            
+            // Log the FULL output for debugging
+            logger.info("=== FULL READINESS CHECK OUTPUT ===")
+            logger.info("Output length: ${output.length} chars")
+            logger.info("Raw output: '$output'")
+            logger.info("=== END OUTPUT ===")
+            
+            // More comprehensive readiness checks
+            val isReady = output.contains("My Vault>", ignoreCase = true) ||
+                        output.contains("Keeper>", ignoreCase = true) ||
+                        output.contains("Not logged in>", ignoreCase = true) ||
+                        output.contains("Persistent Login: ON", ignoreCase = true) ||
+                        output.contains("Status: SUCCESSFUL", ignoreCase = true) ||
+                        output.contains("Device Name:", ignoreCase = true) ||
+                        output.contains("Decrypted [", ignoreCase = true) ||
+                        output.contains("record(s)", ignoreCase = true) ||
+                        (output.isNotBlank() && !output.contains("error", ignoreCase = true) && !output.contains("failed", ignoreCase = true))
+            
+            if (isReady) {
+                logger.info("Keeper shell is ready and authenticated")
+            } else {
+                logger.warn("Shell readiness check failed")
+                logger.warn("Expected patterns not found in output")
+                
+                // Try one more simple test - just send a newline
+                try {
+                    logger.info("Attempting final readiness test...")
+                    val testOutput = KeeperShellService.executeCommand("", 10)
+                    logger.info("Final test output: '$testOutput'")
+                    
+                    if (testOutput.contains(">") || testOutput.isBlank()) {
+                        logger.info("Final test passed - shell appears ready")
+                        return true
+                    }
+                } catch (e: Exception) {
+                    logger.warn("Final test failed: ${e.message}")
                 }
             }
             
-            val output = KeeperShellService.executeCommand("this-device", 10)
-            val isReady = output.contains("Persistent Login: ON", ignoreCase = true) ||
-                         output.contains("Status: SUCCESSFUL", ignoreCase = true) ||
-                         output.contains("Device Name:", ignoreCase = true)
-            
-            logger.info("Keeper ready status: $isReady")
             return isReady
             
         } catch (ex: Exception) {
-            logger.error("Error checking Keeper readiness", ex)
+            logger.error("Error checking Keeper readiness: ${ex.message}")
+            logger.debug("Full exception details", ex)
             false
         }
     }

@@ -9,8 +9,15 @@ import com.intellij.openapi.ui.Messages
 import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.diagnostic.thisLogger
 import keepersecurity.service.KeeperShellService
-import org.json.JSONArray
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import keepersecurity.model.KeeperFolder
+import keepersecurity.util.KeeperJsonUtils
+import keepersecurity.util.KeeperCommandUtils
+import kotlinx.serialization.ExperimentalSerializationApi
 
+@OptIn(ExperimentalSerializationApi::class)
 class KeeperFolderSelectAction : AnAction("Get Keeper Folder") {
     private val logger = thisLogger()
 
@@ -26,10 +33,14 @@ class KeeperFolderSelectAction : AnAction("Get Keeper Folder") {
                     val startTime = System.currentTimeMillis()
                     
                     // Add retry logic for the first run
-                    val output = executeCommandWithRetry("ls --format=json -f -R", 3)
+                    val output = KeeperCommandUtils.executeCommandWithRetry(
+                        "ls --format=json -f -R",
+                        KeeperCommandUtils.Presets.jsonArray(maxRetries = 3, timeoutSeconds = 90),
+                        logger
+                    )
                     
                     val duration = System.currentTimeMillis() - startTime
-                    logger.info("⚡ Command executed in ${duration}ms")
+                    logger.info("Command executed in ${duration}ms")
                     
                     parseKeeperFolders(output)
                     
@@ -64,7 +75,7 @@ class KeeperFolderSelectAction : AnAction("Get Keeper Folder") {
 
                         Messages.showInfoMessage(
                             project,
-                            "✅ Folder '${selectedFolder.first}' with UUID '${selectedFolder.second}' has been saved.\n⚡ Executed in persistent shell!",
+                            "Folder '${selectedFolder.first}' with UUID '${selectedFolder.second}' has been saved.\nExecuted in persistent shell!",
                             "Folder Saved"
                         )
                     }
@@ -73,85 +84,37 @@ class KeeperFolderSelectAction : AnAction("Get Keeper Folder") {
         }.queue()
     }
 
-    /**
-     * Execute command with retry logic to handle shell startup timing
-     */
-    private fun executeCommandWithRetry(command: String, maxRetries: Int): String {
-        var lastException: Exception? = null
-        
-        for (attempt in 1..maxRetries) {
-            try {
-                logger.info("🔄 Attempt $attempt/$maxRetries: $command")
-                
-                val output = KeeperShellService.executeCommand(command, 45) // Longer timeout for first run
-                
-                // Log the raw output for debugging
-                logger.info("📥 Raw output (${output.length} chars): ${output.take(200)}${if (output.length > 200) "..." else ""}")
-                
-                // Check if output looks valid
-                if (output.isBlank()) {
-                    throw RuntimeException("Command returned empty output")
-                }
-                
-                // Check if it contains JSON
-                if (!output.contains('[')) {
-                    logger.warn("⚠️ Output doesn't contain JSON array, might be startup messages")
-                    logger.warn("📋 Full output: $output")
-                    
-                    if (attempt < maxRetries) {
-                        logger.info("🔄 Retrying in 2 seconds...")
-                        Thread.sleep(2000)
-                        continue
-                    } else {
-                        throw RuntimeException("No JSON array found in output after $maxRetries attempts")
-                    }
-                }
-                
-                logger.info("✅ Got valid JSON output on attempt $attempt")
-                return output
-                
-            } catch (ex: Exception) {
-                lastException = ex
-                logger.warn("❌ Attempt $attempt failed: ${ex.message}")
-                
-                if (attempt < maxRetries) {
-                    logger.info("🔄 Retrying in 2 seconds...")
-                    Thread.sleep(2000)
-                } else {
-                    logger.error("❌ All $maxRetries attempts failed")
-                }
-            }
-        }
-        
-        // If we get here, all retries failed
-        throw lastException ?: RuntimeException("Command failed after $maxRetries attempts")
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        allowTrailingComma = true
     }
 
     private fun parseKeeperFolders(output: String): List<Pair<String, String>> {
         try {
-            val jsonStart = output.indexOf('[')
-            if (jsonStart == -1) {
-                logger.error("📋 No JSON array found in output: $output")
-                throw RuntimeException("No JSON found in output.")
+            logger.debug("Raw output: ${output.take(200)}...")
+            
+            // Use the utility to extract JSON array
+            val jsonString = KeeperJsonUtils.extractJsonArray(output, logger)
+            val folders = json.decodeFromString<List<KeeperFolder>>(jsonString)
+            
+            val folderPairs = folders.mapNotNull { folder ->
+                if (folder.name.isNotBlank() && folder.folderUid.isNotBlank()) {
+                    logger.debug("Parsed folder: '${folder.name}' -> '${folder.folderUid}'")
+                    Pair(folder.name, folder.folderUid)
+                } else {
+                    logger.debug("Skipping folder with missing data: $folder")
+                    null
+                }
             }
             
-            val jsonString = output.substring(jsonStart)
-            logger.debug("📋 Parsing JSON: ${jsonString.take(100)}...")
-
-            val jsonArray = JSONArray(jsonString)
-            val result = (0 until jsonArray.length()).mapNotNull { i ->
-                val obj = jsonArray.getJSONObject(i)
-                val name = obj.optString("name")
-                val uuid = obj.optString("folder_uid")
-                if (name.isNotBlank() && uuid.isNotBlank()) name to uuid else null
-            }
-            
-            logger.info("✅ Parsed ${result.size} folders from JSON")
-            return result
+            logger.info("Successfully parsed ${folderPairs.size} folders")
+            return folderPairs
             
         } catch (ex: Exception) {
-            logger.error("❌ Failed to parse JSON from output: $output", ex)
-            throw RuntimeException("Failed to parse folder JSON: ${ex.message}")
+            logger.error("Failed to parse folders from output", ex)
+            logger.error("Raw output was: $output")
+            throw RuntimeException("Failed to parse folder data: ${ex.message}")
         }
     }
 

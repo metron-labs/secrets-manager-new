@@ -5,12 +5,9 @@
 
     <depends>com.intellij.modules.platform</depends>
 
-    <resource-bundle>messages.MyBundle</resource-bundle>
+    <resource-bundle>messages.KeeperSecurity</resource-bundle>
 
     <extensions defaultExtensionNs="com.intellij">
-        <!-- Existing tool window -->
-        <toolWindow factoryClass="org.jetbrains.plugins.template.toolWindow.MyToolWindowFactory" id="MyToolWindow"/>
-
         <!-- Register KeeperVaultService -->
         <projectService serviceImplementation="keepersecurity.action.KeeperVaultService"/>
 
@@ -18,7 +15,6 @@
         <applicationService serviceImplementation="keepersecurity.service.KeeperPluginService"/>
         
         <!-- Startup activities -->
-        <postStartupActivity implementation="org.jetbrains.plugins.template.startup.MyProjectActivity" />
         <postStartupActivity implementation="keepersecurity.service.KeeperStartupActivity" />
     </extensions>
 

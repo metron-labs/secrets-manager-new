@@ -13,6 +13,7 @@ import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.ide.util.PropertiesComponent
 import keepersecurity.service.KeeperShellService
+import keepersecurity.util.KeeperCommandUtils
 
 class KeeperRecordAddAction : AnAction("Add Keeper Record") {
     private val logger = thisLogger()
@@ -60,7 +61,7 @@ class KeeperRecordAddAction : AnAction("Add Keeper Record") {
                     val recordUid = createKeeperRecord(title, fieldName, selectedText)
                     
                     val duration = System.currentTimeMillis() - startTime
-                    logger.info("⚡ Record created in ${duration}ms")
+                    logger.info("Record created in ${duration}ms")
                     
                     // Update editor on EDT
                     ApplicationManager.getApplication().invokeLater {
@@ -75,7 +76,7 @@ class KeeperRecordAddAction : AnAction("Add Keeper Record") {
 
                         Messages.showInfoMessage(
                             project, 
-                            "✅ Keeper record created!\n\n$keeperReference\n\n⚡ Created via persistent shell in ${duration}ms!", 
+                            "Keeper record created!\n\n$keeperReference\n\nCreated via persistent shell in ${duration}ms!", 
                             "Keeper Record Added"
                         )
                     }
@@ -107,7 +108,7 @@ class KeeperRecordAddAction : AnAction("Add Keeper Record") {
 
         if (!folderUUID.isNullOrBlank()) {
             commandParts.add("--folder=\"$folderUUID\"")
-            logger.info("📁 Using folder UUID: $folderUUID")
+            logger.info("Using folder UUID: $folderUUID")
         }
 
         // Format the field based on type and content
@@ -128,71 +129,45 @@ class KeeperRecordAddAction : AnAction("Add Keeper Record") {
         commandParts.add(formattedField)
 
         val command = commandParts.joinToString(" ")
-        logger.info("🔄 Creating record with command: $command")
+        logger.info("Creating record with command: $command")
 
-        // Execute with retry logic (similar to folder action)
-        val output = executeCommandWithRetry(command, 3)
+        // Execute with proper validation for record creation
+        val output = KeeperCommandUtils.executeCommandWithRetry(
+            command,
+            KeeperCommandUtils.RetryConfig(
+                maxRetries = 5, // More retries for first-time runs
+                timeoutSeconds = 45, // Longer timeout for record creation
+                retryDelayMs = 2000, // Longer delay between retries
+                logLevel = KeeperCommandUtils.LogLevel.INFO,
+                validation = KeeperCommandUtils.ValidationConfig(
+                    customValidator = { output ->
+                        // Should contain a record UID and NOT be sync status
+                        val hasUid = Regex("""[A-Za-z0-9_-]{22}""").containsMatchIn(output)
+                        val isNotSyncStatus = !output.contains("Decrypted [") && 
+                                            !output.contains("record(s)") &&
+                                            !output.contains("breachwatch list") &&
+                                            !output.contains("Use \"breachwatch list\" command")
+                        
+                        val isValid = hasUid && isNotSyncStatus
+                        
+                        if (!isValid) {
+                            logger.debug("Record creation validation failed - hasUid: $hasUid, isNotSyncStatus: $isNotSyncStatus")
+                            logger.debug("Output: ${output.take(150)}...")
+                        }
+                        
+                        isValid
+                    }
+                )
+            ),
+            logger
+        )
 
         // Extract UID from output
         val recordUid = Regex("""[A-Za-z0-9_-]{22}""").find(output)?.value
             ?: throw RuntimeException("Could not find UID in Keeper CLI output. Output: $output")
 
-        logger.info("✅ Created record with UID: $recordUid")
+        logger.info("Created record with UID: $recordUid")
         return recordUid
-    }
-
-    /**
-     * Execute command with retry logic to handle shell startup timing
-     */
-    private fun executeCommandWithRetry(command: String, maxRetries: Int): String {
-        var lastException: Exception? = null
-        
-        for (attempt in 1..maxRetries) {
-            try {
-                logger.info("🔄 Attempt $attempt/$maxRetries: $command")
-                
-                val output = KeeperShellService.executeCommand(command, 45) // Longer timeout for record creation
-                
-                // Log the raw output for debugging
-                logger.info("📥 Raw output (${output.length} chars): ${output.take(300)}${if (output.length > 300) "..." else ""}")
-                
-                // Check if output looks valid
-                if (output.isBlank()) {
-                    throw RuntimeException("Command returned empty output")
-                }
-                
-                // Check if it contains a UID (successful record creation)
-                if (!Regex("""[A-Za-z0-9_-]{22}""").containsMatchIn(output)) {
-                    logger.warn("⚠️ Output doesn't contain a valid UID, might be an error or startup messages")
-                    logger.warn("📋 Full output: $output")
-                    
-                    if (attempt < maxRetries) {
-                        logger.info("🔄 Retrying in 2 seconds...")
-                        Thread.sleep(2000)
-                        continue
-                    } else {
-                        throw RuntimeException("No valid UID found in output after $maxRetries attempts")
-                    }
-                }
-                
-                logger.info("✅ Got valid record creation output on attempt $attempt")
-                return output
-                
-            } catch (ex: Exception) {
-                lastException = ex
-                logger.warn("❌ Attempt $attempt failed: ${ex.message}")
-                
-                if (attempt < maxRetries) {
-                    logger.info("🔄 Retrying in 2 seconds...")
-                    Thread.sleep(2000)
-                } else {
-                    logger.error("❌ All $maxRetries attempts failed")
-                }
-            }
-        }
-        
-        // If we get here, all retries failed
-        throw lastException ?: RuntimeException("Command failed after $maxRetries attempts")
     }
 
     private fun showError(message: String, project: Project) {

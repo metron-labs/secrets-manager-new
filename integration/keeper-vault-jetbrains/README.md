@@ -1,5 +1,13 @@
 # Keeper Security JetBrains Plugin
 
+<!-- Plugin description -->
+A comprehensive JetBrains IDE plugin that integrates Keeper Security vault functionality directly into your development workflow. The plugin provides secure secret management capabilities including saving, retrieving, generating, and running commands with secrets from Keeper Security vault.
+
+The goal is to enable developers to manage secrets securely without leaving their development environment, while maintaining the highest security standards and providing seamless integration with existing Keeper Security infrastructure.
+
+**Supported IDEs:** IntelliJ IDEA, PyCharm, WebStorm, PhpStorm, RubyMine, CLion, GoLand, and all other JetBrains IDEs.
+<!-- Plugin description end -->
+
 ## Table of Contents
 - [Overview](#overview)
 - [Features](#features)
