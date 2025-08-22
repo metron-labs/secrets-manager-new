@@ -5,7 +5,7 @@ This is the ServiceNow MID Server custom external credential resolver for the Ke
 Keeper External Credential Resolver requires JDK 1.8 or newer  
 IntelliJ IDEA or any equivalent IDE
 
-> ⚠️ JRE 8 versions prior to u161 require strong cryptography (JCE) to be enabled.
+> JRE 8 versions prior to u161 require strong cryptography (JCE) to be enabled.
 Latest versions of JRE have strong cryptography enabled [by default](https://bugs.openjdk.java.net/browse/JDK-8170157).
 
 # Steps to build
@@ -34,9 +34,9 @@ Latest versions of JRE have strong cryptography enabled [by default](https://bug
 
 # Finding records
 Credential ID (credId parameter) passed from MID Server to Credential Resolver must be either a valid record UID (22 alphanumeric characters incl. "-" and "_") or in the following format type:title. The second format allows searches by type only or by title only (or both, but single ":" is invalid combination)
-> ⚠️ When using `type:title` format for the credential make sure there's only one matching record, since multiple matches result in error.
+> When using `type:title` format for the credential make sure there's only one matching record, since multiple matches result in error.
 
-> ⚠️ We recommend using record UID - first to guarantee uniqueness, second to avoid downloading all records with every single request to do a local search by type/title (due to zero knowledge nature of the keeper vault).
+> We recommend using record UID - first to guarantee uniqueness, second to avoid downloading all records with every single request to do a local search by type/title (due to zero knowledge nature of the keeper vault).
 
 #### Examples:
 _(zero or two or more matches result in an error)_  
@@ -55,7 +55,7 @@ To change the custom field labels prefix update the _config.xml_ in MID Server w
 
 > ️ⓘ Use custom fields with type `text`, `multiline` or `hidden` depending on the visibility you want in your Keeper Vault.
 
-> ⚠️ When Login record type is used any custom fields for username/password are ignored _(even if properly labeled mid_user, mid_pswd)_ as these values always come from the Login record type standard fields - Login/Password.
+> When Login record type is used any custom fields for username/password are ignored _(even if properly labeled mid_user, mid_pswd)_ as these values always come from the Login record type standard fields - Login/Password.
 
 #### Examples:  
  + Credential type `jdbc` map to Keeper record type `Login` (using standard Login/Password field)
