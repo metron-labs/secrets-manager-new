@@ -330,6 +330,7 @@ object KeeperShellService {
                 logger.debug("Sent newline to trigger prompt")
             } catch (e: Exception) {
                 logger.debug("Error sending newline", e)
+                showError(project, "Command failed: ${e.message}")
             }
         }
     }

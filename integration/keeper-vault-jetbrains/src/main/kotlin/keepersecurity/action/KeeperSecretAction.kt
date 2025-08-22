@@ -369,10 +369,10 @@ class KeeperSecretAction : AnAction("Run Keeper Securely") {
             }
             
             // Log the FULL output for debugging
-            logger.info("=== FULL READINESS CHECK OUTPUT ===")
+            logger.info("FULL READINESS CHECK OUTPUT")
             logger.info("Output length: ${output.length} chars")
             logger.info("Raw output: '$output'")
-            logger.info("=== END OUTPUT ===")
+            logger.info("END OUTPUT")
             
             // More comprehensive readiness checks
             val isReady = output.contains("My Vault>", ignoreCase = true) ||

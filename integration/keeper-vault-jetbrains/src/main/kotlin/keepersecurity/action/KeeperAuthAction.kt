@@ -19,7 +19,7 @@ class KeeperAuthAction : AnAction("Check Keeper Authorization") {
         object : Task.Backgroundable(project, "Checking Keeper Authentication...", false) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    logger.info("KEEPER AUTH: Checking biometric and persistent login ===")
+                    logger.info("KEEPER AUTH: Checking biometric and persistent login")
                     
                     indicator.text = "Connecting to Keeper shell..."
                     
@@ -105,34 +105,63 @@ class KeeperAuthAction : AnAction("Check Keeper Authorization") {
     
     private fun checkBiometricAuth(): BiometricStatus {
         return try {
-            logger.info("Checking if biometric authentication was used during login...")
+            logger.info("Checking biometric authentication...")
             
-            // Wait a moment for shell to fully complete startup and capture all output
-            Thread.sleep(20000)
+            val output = KeeperCommandUtils.executeCommandWithRetry(
+                "biometric verify",
+                KeeperCommandUtils.RetryConfig(
+                    maxRetries = 2,
+                    timeoutSeconds = 50,
+                    retryDelayMs = 2000,
+                    logLevel = KeeperCommandUtils.LogLevel.INFO,
+                    validation = KeeperCommandUtils.ValidationConfig(
+                        customValidator = { result ->
+                            // Should contain biometric results, NOT sync status
+                            val hasBiometricResult = result.contains("Biometric Authentication", ignoreCase = true) ||
+                                                result.contains("Status:", ignoreCase = true)
+                            
+                            val isNotSyncStatus = !result.contains("Decrypted [") && 
+                                                !result.contains("record(s)") &&
+                                                !result.contains("breachwatch")
+                            
+                            hasBiometricResult && isNotSyncStatus
+                        }
+                    )
+                ),
+                logger
+            )
             
-            val startupOutput = KeeperShellService.getLastStartupOutput()
+            logger.info("Biometric verify FINAL output: $output")
             
-            // DEBUG: Log the full output to see what we're actually getting
-            logger.info("=== FULL STARTUP OUTPUT DEBUG ===")
-            logger.info("Output length: ${startupOutput.length}")
-            logger.info("Full output:\n$startupOutput")
-            logger.info("=== END DEBUG OUTPUT ===")
-            
-            // Look for the exact string from your terminal
-            val hasBiometric = startupOutput.contains("Successfully authenticated with Biometric Login", ignoreCase = true)
-            
-            logger.info("Biometric string found: $hasBiometric")
-            
-            if (hasBiometric) {
-                logger.info("Biometric authentication detected!")
-                BiometricStatus.SUCCESS
-            } else {
-                logger.info("ℹ️  No biometric authentication detected in startup output")
-                BiometricStatus.FAILED
+            when {
+                // Success patterns - exactly what your terminal shows
+                output.contains("Status: SUCCESSFUL", ignoreCase = true) -> {
+                    logger.info("Biometric verification successful")
+                    BiometricStatus.SUCCESS
+                }
+                
+                // Not registered patterns
+                output.contains("not registered", ignoreCase = true) || 
+                output.contains("no biometric", ignoreCase = true) -> {
+                    logger.info("Biometric not registered")
+                    BiometricStatus.NOT_REGISTERED
+                }
+                
+                // Not supported patterns  
+                output.contains("not supported", ignoreCase = true) ||
+                output.contains("not available", ignoreCase = true) -> {
+                    logger.info("Biometric not supported on this device")
+                    BiometricStatus.NOT_SUPPORTED
+                }
+                
+                else -> {
+                    logger.warn("Biometric result unclear")
+                    logger.warn("Full output: $output")
+                    BiometricStatus.FAILED
+                }
             }
-            
         } catch (ex: Exception) {
-            logger.error("Error checking biometric from startup", ex)
+            logger.error("Biometric check exception", ex)
             BiometricStatus.FAILED
         }
     }
@@ -206,7 +235,7 @@ class KeeperAuthAction : AnAction("Check Keeper Authorization") {
                 
                 // Not enabled patterns
                 output.contains("Persistent Login: OFF", ignoreCase = true) -> {
-                    logger.info("ℹ️  Persistent login is disabled")
+                    logger.info("Persistent login is disabled")
                     PersistentStatus.NOT_ENABLED
                 }
                 
